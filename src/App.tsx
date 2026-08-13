@@ -1,16 +1,14 @@
 /**
  * App.tsx — Main Single Page Application
- * Online  → audio sent to MockServerService (logs only)
- * Offline → audio processed by local Whisper model (WebGPU or WASM)
+ * Local AI inference using WebGPU or WASM
  */
 import { useCallback, useRef, useState } from "react";
-import { useNetworkStatus } from "./hooks/useNetworkStatus";
 import { useWebGPU } from "./hooks/useWebGPU";
 import { useWhisperEngine } from "./hooks/useWhisperEngine";
 import { useAudioStream } from "./hooks/useAudioStream";
 import { blobToFloat32Array } from "./utils/utils";
-import { sendAudioToServer } from "./services/MockServerService";
-import NetworkStatus from "./components/NetworkStatus";
+import ModelSourceToggle from "./components/ModelSourceToggle";
+import type { ModelSource } from "./components/ModelSourceToggle";
 import StatusCard from "./components/StatusCard";
 import ModelLoader from "./components/ModelLoader";
 import Recorder from "./components/Recorder";
@@ -20,20 +18,16 @@ import StreamViewer from "./components/StreamViewer";
 import TranscriptHistory from "./components/TranscriptHistory";
 
 export default function App() {
-  const { isOnline, isManual, realOnline, toggleMode, resetToAuto } = useNetworkStatus();
   const { gpuInfo } = useWebGPU();
   const { state: ws, loadModel, runInference, clearTranscripts } = useWhisperEngine();
+  const [modelSource, setModelSource] = useState<ModelSource>("huggingface");
 
   const fullBlobRef = useRef<Blob | null>(null);
   const [hasAudio, setHasAudio] = useState(false);
-  const [inferenceTime, setInferenceTime] = useState<number | null>(null);
   const [task, setTask] = useState<"transcribe" | "translate">("transcribe");
 
   const handleChunk = useCallback(async (blob: Blob) => {
-    if (isOnline) {
-      await sendAudioToServer(blob, task);
-    }
-    if (!isOnline && ws.modelStatus === "ready" && !ws.isInferring) {
+    if (ws.modelStatus === "ready" && !ws.isInferring) {
       try {
         const audio = await blobToFloat32Array(blob);
         runInference(audio, task);
@@ -41,46 +35,39 @@ export default function App() {
         console.error("Chunk decode error:", e);
       }
     }
-  }, [isOnline, ws.modelStatus, ws.isInferring, task, runInference]);
+  }, [ws.modelStatus, ws.isInferring, task, runInference]);
 
   const handleStop = useCallback((blob: Blob) => {
     fullBlobRef.current = blob;
     setHasAudio(true);
   }, []);
 
+  const recorder = useAudioStream({ onChunk: handleChunk, onStop: handleStop });
+
   const handleFileUpload = useCallback((blob: Blob) => {
     fullBlobRef.current = blob;
     setHasAudio(true);
-  }, []);
+    recorder.setAudioURL(URL.createObjectURL(blob));
+  }, [recorder]);
 
   const handleInfer = useCallback(async (inferTask: "transcribe" | "translate") => {
     if (!fullBlobRef.current) return;
     setTask(inferTask);
-    if (isOnline) {
-      const t0 = performance.now();
-      await sendAudioToServer(fullBlobRef.current, inferTask);
-      setInferenceTime(performance.now() - t0);
-      return;
-    }
     try {
       const audio = await blobToFloat32Array(fullBlobRef.current);
       runInference(audio, inferTask);
     } catch (e) {
       console.error("Audio decode error:", e);
     }
-  }, [isOnline, runInference]);
+  }, [runInference]);
 
-  const recorder = useAudioStream({ onChunk: handleChunk, onStop: handleStop });
-  const latestInferenceTime = ws.transcripts[0]?.inferenceTime ?? inferenceTime ?? null;
+  const latestInferenceTime = ws.transcripts[0]?.inferenceTime ?? null;
 
   return (
     <div className="min-h-screen bg-app text-white">
-      <NetworkStatus
-        isOnline={isOnline}
-        isManual={isManual}
-        realOnline={realOnline}
-        onToggle={toggleMode}
-        onReset={resetToAuto}
+      <ModelSourceToggle
+        source={modelSource}
+        onToggle={() => setModelSource((s) => (s === "huggingface" ? "local" : "huggingface"))}
       />
       <div className="max-w-5xl mx-auto px-4 py-10 space-y-6">
         <header className="text-center space-y-2 pb-4">
@@ -102,17 +89,16 @@ export default function App() {
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
           <div className="space-y-5">
-            <StatusCard gpuInfo={gpuInfo} device={ws.device} isOnline={isOnline} />
-            {!isOnline && (
-              <ModelLoader
-                status={ws.modelStatus}
-                progress={ws.loadProgress}
-                device={ws.device}
-                loadTime={ws.loadTime}
-                error={ws.error}
-                onLoad={loadModel}
-              />
-            )}
+            <StatusCard gpuInfo={gpuInfo} device={ws.device} isOnline={false} />
+            <ModelLoader
+              status={ws.modelStatus}
+              progress={ws.loadProgress}
+              loadFile={ws.loadFile}
+              device={ws.device}
+              loadTime={ws.loadTime}
+              error={ws.error}
+              onLoad={() => loadModel(modelSource)}
+            />
           </div>
           <div className="space-y-5">
             <Recorder
@@ -136,7 +122,7 @@ export default function App() {
               isInferring={ws.isInferring}
               inferenceTime={latestInferenceTime}
               hasAudio={hasAudio}
-              isOnline={isOnline}
+              isOnline={false}
               onTranscribe={() => handleInfer("transcribe")}
               onTranslate={() => handleInfer("translate")}
             />

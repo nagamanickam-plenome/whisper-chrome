@@ -4,6 +4,7 @@
  * Handles model loading, inference requests, and progress reporting.
  */
 import { useState, useRef, useCallback, useEffect } from "react";
+import type { ModelSource } from "../components/ModelSourceToggle";
 
 export type ModelStatus = "idle" | "loading" | "ready" | "error";
 export type ExecutionDevice = "webgpu" | "wasm" | "unknown";
@@ -20,6 +21,7 @@ export interface TranscriptChunk {
 export interface WhisperEngineState {
   modelStatus: ModelStatus;
   loadProgress: number;
+  loadFile: string | null;
   loadTime: number | null;
   device: ExecutionDevice;
   error: string | null;
@@ -33,6 +35,7 @@ export function useWhisperEngine() {
   const [state, setState] = useState<WhisperEngineState>({
     modelStatus: "idle",
     loadProgress: 0,
+    loadFile: null,
     loadTime: null,
     device: "unknown",
     error: null,
@@ -42,7 +45,7 @@ export function useWhisperEngine() {
   });
 
   // Initialize and load model
-  const loadModel = useCallback(() => {
+  const loadModel = useCallback((source: ModelSource) => {
     if (workerRef.current) {
       workerRef.current.terminate();
     }
@@ -60,7 +63,11 @@ export function useWhisperEngine() {
 
       switch (msg.type) {
         case "loading":
-          setState((s) => ({ ...s, loadProgress: msg.progress ?? s.loadProgress }));
+          setState((s) => ({
+            ...s, 
+            loadProgress: msg.progress ?? s.loadProgress,
+            loadFile: msg.file ?? s.loadFile
+          }));
           break;
         case "loaded":
           setState((s) => ({
@@ -111,7 +118,7 @@ export function useWhisperEngine() {
       }));
     };
 
-    worker.postMessage({ type: "load" });
+    worker.postMessage({ type: "load", source });
   }, []);
 
   // Run transcription or translation on a Float32Array

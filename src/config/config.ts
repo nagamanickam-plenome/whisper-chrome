@@ -12,7 +12,8 @@
 // ============================================================
 
 // export const MODEL_ID = "onnx-community/whisper-tiny";
-export const MODEL_ID = "Xenova/whisper-tiny";
+// export const MODEL_ID = 'onnx-community/whisper-small';
+export const MODEL_ID = 'onnx-community/onnx';
 
 export const CHUNK_DURATION_MS = 4000; // audio chunk size for streaming (ms)
 

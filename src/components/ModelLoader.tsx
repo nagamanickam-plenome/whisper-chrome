@@ -11,13 +11,14 @@ import { formatMs } from "../utils/utils";
 interface Props {
   status: ModelStatus;
   progress: number;
+  loadFile: string | null;
   device: ExecutionDevice;
   loadTime: number | null;
   error: string | null;
   onLoad: () => void;
 }
 
-export default function ModelLoader({ status, progress, device, loadTime, error, onLoad }: Props) {
+export default function ModelLoader({ status, progress, loadFile, device, loadTime, error, onLoad }: Props) {
   const DeviceIcon = device === "webgpu" ? Zap : Cpu;
 
   return (
@@ -54,7 +55,9 @@ export default function ModelLoader({ status, progress, device, loadTime, error,
           <div className="flex justify-between text-sm">
             <span className="text-slate-400 flex items-center gap-1">
               <Download size={13} className="animate-bounce" />
-              Downloading model…
+              <span className="truncate max-w-[150px]">
+                {loadFile ? `Loading ${loadFile}` : 'Downloading model…'}
+              </span>
             </span>
             <span className="text-violet-300 font-mono">{progress.toFixed(1)}%</span>
           </div>

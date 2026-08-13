@@ -19,12 +19,6 @@ import { MODEL_ID } from "../config/config";
 env.useBrowserCache = true;
 env.allowLocalModels = false;
 
-// Reduce WASM threads to 1 to prevent std::bad_alloc (Out of Memory)
-// ORT creates memory pools per thread, which can blow up the 2GB WASM limit for large models!
-if (env.backends && env.backends.onnx && env.backends.onnx.wasm) {
-  env.backends.onnx.wasm.numThreads = 1;
-}
-
 type WorkerMessage =
   | { type: "load"; source: "huggingface" | "local" }
   | { type: "transcribe"; audio: Float32Array; task: "transcribe" | "translate" }
@@ -72,63 +66,48 @@ async function clearCaches() {
  * Automatically falls back to WASM if WebGPU fails.
  */
 async function loadPipeline(
-  onProgress: any
+  onProgress: (p: { progress?: number }) => void
 ): Promise<{ pipe: Awaited<ReturnType<typeof pipeline>>; device: "webgpu" | "wasm" }> {
   const preferred = await getPreferredDevice();
 
   if (preferred === "webgpu") {
     try {
-      self.postMessage({ type: "log", message: `[Worker] 🟢 WebGPU is available. Attempting to load ${MODEL_ID} (fp32) on WebGPU...` });
+      self.postMessage({ type: "log", message: `[Worker] Trying WebGPU with fp32 (${MODEL_ID})…` });
 
       const pipe = await pipeline("automatic-speech-recognition", MODEL_ID, {
         device: "webgpu",
         dtype: "fp32", // Full precision for WebGPU to avoid DequantizeLinear bugs
-        subfolder: MODEL_ID === "onnx-community/onnx" ? "" : "onnx", // Prevent appending /onnx/ to custom models
         progress_callback: onProgress,
       });
 
-      self.postMessage({ type: "log", message: `[Worker] ✅ Successfully loaded on WebGPU.` });
       return { pipe, device: "webgpu" };
     } catch (err) {
       const msg = String(err).slice(0, 160);
-      self.postMessage({ type: "log", message: `[Worker] ⚠️ WebGPU failed: ${msg}` });
-      self.postMessage({ type: "log", message: `[Worker] 🔄 Initiating fallback to CPU (WASM)...` });
+      self.postMessage({ type: "log", message: `[Worker] WebGPU failed: ${msg}` });
+      self.postMessage({ type: "log", message: "[Worker] Falling back to CPU (WASM q8)…" });
     }
   }
 
-  // WASM fallback
-  const primaryDtype = MODEL_ID === "onnx-community/onnx" ? "q8" : "fp32";
-  self.postMessage({ type: "log", message: `[Worker] 🔵 Loading on CPU (WASM) with dtype: ${primaryDtype} for ${MODEL_ID}...` });
+  // WASM fallback with 8-bit quantization
+  self.postMessage({ type: "log", message: `[Worker] Loading on CPU WASM (q8) (${MODEL_ID})…` });
 
   try {
     const pipe = await pipeline("automatic-speech-recognition", MODEL_ID, {
       device: "wasm",
-      dtype: primaryDtype,
-      subfolder: MODEL_ID === "onnx-community/onnx" ? "" : "onnx", // Prevent appending /onnx/ to custom models
-      session_options: {
-        logSeverityLevel: 4,
-        executionMode: "sequential",
-        interOpNumThreads: 1,
-        intraOpNumThreads: 1,
-        enableCpuMemArena: false,
-        enableMemPattern: false,
-        graphOptimizationLevel: "all"
-      },
+      dtype:"fp32",
       progress_callback: onProgress,
     });
-    self.postMessage({ type: "log", message: `[Worker] ✅ Successfully loaded on CPU (WASM).` });
     return { pipe, device: "wasm" };
   } catch (err) {
     const msg = String(err).slice(0, 160);
-    self.postMessage({ type: "log", message: `[Worker] ⚠️ CPU (WASM) primary load failed: ${msg}` });
-    self.postMessage({ type: "log", message: `[Worker] 🔄 Ultimate fallback to CPU (WASM) with default dtype...` });
+    self.postMessage({ type: "log", message: `[Worker] WASM q8 failed: ${msg}` });
+    self.postMessage({ type: "log", message: "[Worker] Ultimate fallback to WASM fp32…" });
 
     const pipe = await pipeline("automatic-speech-recognition", MODEL_ID, {
       device: "wasm",
-      subfolder: MODEL_ID === "onnx-community/onnx" ? "" : "onnx", // Prevent appending /onnx/ to custom models
+      dtype: "fp32",
       progress_callback: onProgress,
     });
-    self.postMessage({ type: "log", message: `[Worker] ✅ Successfully loaded on ultimate fallback (WASM).` });
     return { pipe, device: "wasm" };
   }
 }
@@ -153,7 +132,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerMessage>) => {
         env.useBrowserCache = true;
       }
 
-      const { pipe, device } = await loadPipeline((progress: any) => {
+      const { pipe, device } = await loadPipeline((progress) => {
         if (typeof progress.progress === "number") {
           self.postMessage({ type: "loading", progress: progress.progress, file: progress.file });
         }
@@ -176,56 +155,25 @@ self.addEventListener("message", async (event: MessageEvent<WorkerMessage>) => {
       const startTime = performance.now();
       const isWhisper = transcriber.model.config.is_encoder_decoder === true;
       const options: any = {
-        chunk_length_s: 10, // Process audio in 10-second chunks to save memory
-        stride_length_s: 2, // Overlap chunks by 2 seconds for context
+        return_timestamps: true,
       };
 
       if (isWhisper) {
-        options.return_timestamps = true;
         options.task = msg.task;
         options.language = msg.task === "translate" ? "en" : undefined;
-        
-        // Let transformers.js handle chunking for standard Whisper models
-        options.chunk_length_s = 10;
-        options.stride_length_s = 2;
-        
-        const result = await (transcriber as any)(msg.audio, options);
-        const inferenceTime = performance.now() - startTime;
-        const output = Array.isArray(result) ? result[0] : result;
-        
-        self.postMessage({
-          type: "result",
-          text: (output as { text: string }).text?.trim() ?? "",
-          language: (output as { language?: string }).language ?? "unknown",
-          inferenceTime,
-          chunks: (output as { chunks?: unknown[] }).chunks ?? [],
-        });
-      } else {
-        // Manually chunk audio for custom models (like Conformer) which might ignore chunk_length_s
-        const SAMPLE_RATE = 16000;
-        const CHUNK_SECONDS = 15; // 15 seconds per chunk
-        const chunkSize = CHUNK_SECONDS * SAMPLE_RATE;
-        let fullText = "";
-        
-        for (let i = 0; i < msg.audio.length; i += chunkSize) {
-          const chunk = msg.audio.subarray(i, i + chunkSize);
-          const result = await (transcriber as any)(chunk, options);
-          const output = Array.isArray(result) ? result[0] : result;
-          const text = (output as { text: string }).text?.trim() ?? "";
-          if (text) {
-            fullText += (fullText ? " " : "") + text;
-          }
-        }
-        
-        const inferenceTime = performance.now() - startTime;
-        self.postMessage({
-          type: "result",
-          text: fullText,
-          language: "unknown",
-          inferenceTime,
-          chunks: [],
-        });
       }
+
+      const result = await transcriber(msg.audio, options);
+      const inferenceTime = performance.now() - startTime;
+
+      const output = Array.isArray(result) ? result[0] : result;
+      self.postMessage({
+        type: "result",
+        text: (output as { text: string }).text?.trim() ?? "",
+        language: (output as { language?: string }).language ?? "unknown",
+        inferenceTime,
+        chunks: (output as { chunks?: unknown[] }).chunks ?? [],
+      });
     } catch (err) {
       self.postMessage({ type: "error", error: String(err) });
     }

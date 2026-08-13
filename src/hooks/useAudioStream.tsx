@@ -150,5 +150,5 @@ export function useAudioStream({ onChunk, onStop }: UseAudioStreamOptions) {
     setStatus("idle");
   }, [stopVolumeDetection]);
 
-  return { status, duration, audioURL, volume, start, pause, resume, stop, reset };
+  return { status, duration, audioURL, setAudioURL, volume, start, pause, resume, stop, reset };
 }
